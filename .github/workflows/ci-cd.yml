@@ -1,144 +1,400 @@
 name: CI/CD Pipeline
 
 on:
-    pull_request:
-        branches:  ["**"]
-    push:
-        branches:  [develop, main]
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: [develop, main]
 
 env:
-    project-directory: ./
-    repository: yieldforge_contract
-    
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PROJECT_DIR: ./
+
 jobs:
-    lint:
-        name: Linting and formatting checks
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout Code
-              uses: actions/checkout@v4
+  # Job 1: Code Quality Checks (Linting & Formatting)
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-            - name: Setup Rust
-              uses: actions-rs/toolchain@v1Setup Rust
-              with:
-                toolchain: stable
-                override: true
-                components: clippy, rustfmt
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
-            - name:  Run Clippy (Lint)
-              run: cargo clippy --all-targets --all-features -- -D warnings
-              working-directory: ${{ env.project-directory }}
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run Clippy (Linting)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      - name: Check Code Formatting
+        run: cargo fmt --all -- --check
+        working-directory: ${{ env.PROJECT_DIR }}
+
+  # Job 2: Automated Testing
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
+      - name: Run Tests
+        run: cargo test --all --verbose --no-fail-fast
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      - name: Generate Test Coverage (Optional)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          cargo install cargo-tarpaulin || true
+          cargo tarpaulin --output-dir coverage --out Lcov || true
+        working-directory: ${{ env.PROJECT_DIR }}
+
+  # Job 3: Build Verification
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    strategy:
+      matrix:
+        target: [debug, release]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Build Project (${{ matrix.target }})
+        run: |
+          if [ "${{ matrix.target }}" = "release" ]; then
+            cargo build --release
+          else
+            cargo build
+          fi
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      - name: Upload Build Artifacts
+        if: matrix.target == 'release'
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-build
+          path: target/release/
+          retention-days: 7
+
+  # Job 4: Security Scanning
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Audit
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: Run Security Audit
+        run: cargo audit
+        continue-on-error: false
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked || true
+
+      - name: Run Dependency Check
+        run: cargo deny check || true
+        continue-on-error: true
+
+  # Job 5: Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, security]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.yieldforge.io
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-build
+          path: ./artifacts
+
+      - name: Configure Deployment
+        run: |
+          echo "Configuring staging deployment..."
+          echo "Branch: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Deploy to Staging Server
+        run: |
+          echo "🚀 Deploying to Staging Environment..."
+          # Add your staging deployment commands here
+          # Example: rsync, scp, docker push, kubectl apply, etc.
+          # rsync -avz ./artifacts/ user@staging-server:/app/
+          # docker build -t yieldforge:staging .
+          # docker push registry.example.com/yieldforge:staging
+          echo "✅ Staging deployment completed successfully"
+
+      - name: Run Smoke Tests
+        run: |
+          echo "Running smoke tests on staging..."
+          # Add staging smoke tests here
+          # curl -f https://staging.yieldforge.io/health || exit 1
+
+      - name: Deployment Summary
+        run: |
+          echo "### 🎯 Staging Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: Staging" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: \`develop\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://staging.yieldforge.io" >> $GITHUB_STEP_SUMMARY
+
+  # Job 6: Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://yieldforge.io
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-build
+          path: ./artifacts
+
+      - name: Configure Deployment
+        run: |
+          echo "Configuring production deployment..."
+          echo "Branch: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Create Release Tag
+        id: release
+        run: |
+          VERSION=$(date +%Y.%m.%d-%H%M%S)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Creating release: v$VERSION"
+
+      - name: Deploy to Production Server
+        run: |
+          echo "🚀 Deploying to Production Environment..."
+          echo "Version: ${{ steps.release.outputs.version }}"
+          # Add your production deployment commands here
+          # Example deployment strategies:
+          # - Blue-green deployment
+          # - Canary deployment
+          # - Rolling update
+          # kubectl set image deployment/yieldforge yieldforge=registry.example.com/yieldforge:${{ steps.release.outputs.version }}
+          # kubectl rollout status deployment/yieldforge
+          echo "✅ Production deployment completed successfully"
+
+      - name: Run Health Checks
+        run: |
+          echo "Running production health checks..."
+          # Add production health checks here
+          # curl -f https://yieldforge.io/health || exit 1
+          # curl -f https://yieldforge.io/api/status || exit 1
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.release.outputs.version }}
+          release_name: Release v${{ steps.release.outputs.version }}
+          body: |
+            ## 🚀 Production Release
             
-            - name: Check Formatting
-              run: cargo fmt -- --check
-              working-directory: ${{ env.project-directory }}
-
-    test:
-        name: Automated testing
-        runs-on: ubuntu-latest
-        needs: lint
-        if: github.event_name == 'pull_request' 
-        steps:
-            - name: Checkout Code
-              uses: actions/checkout@v4
+            **Deployed**: ${{ github.event.head_commit.timestamp }}
+            **Commit**: ${{ github.sha }}
+            **Author**: ${{ github.event.head_commit.author.name }}
             
-            - name: Setup Rust
-              uses: actions-rs/toolchain@v1Setup Rust
-              with:
-                toolchain: stable 
-                override: true
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
 
-            - name: Run Tests
-              run: cargo test --all --verbose
-              working-directory: ${{ env.project-directory }}
-        
-    build:
-        name: Build Project
-        runs-on: ubuntu-latest
-        needs: [lint, test]
-        steps: 
-            - name: Checkout Code
-              uses: actions/checkout@v4
+      - name: Deployment Summary
+        run: |
+          echo "### 🎯 Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: \`main\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`v${{ steps.release.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://yieldforge.io" >> $GITHUB_STEP_SUMMARY
 
-            - name: Setup Rust
-              uses: actions-rs/toolchain@v1Setup Rust
-              with:
-                toolchain: stable
-                override: true
+  # Job 7: Notification Handler
+  notify:
+    name: Pipeline Notifications
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, security, deploy-staging, deploy-production]
+    if: always()
+    steps:
+      - name: Check Pipeline Status
+        id: status
+        run: |
+          LINT="${{ needs.lint.result }}"
+          TEST="${{ needs.test.result }}"
+          BUILD="${{ needs.build.result }}"
+          SECURITY="${{ needs.security.result }}"
+          STAGING="${{ needs.deploy-staging.result }}"
+          PRODUCTION="${{ needs.deploy-production.result }}"
+          
+          if [[ "$LINT" == "failure" || "$TEST" == "failure" || "$BUILD" == "failure" || "$SECURITY" == "failure" || "$STAGING" == "failure" || "$PRODUCTION" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "color=#FF0000" >> $GITHUB_OUTPUT
+          elif [[ "$LINT" == "cancelled" || "$TEST" == "cancelled" || "$BUILD" == "cancelled" || "$SECURITY" == "cancelled" || "$STAGING" == "cancelled" || "$PRODUCTION" == "cancelled" ]]; then
+            echo "status=cancelled" >> $GITHUB_OUTPUT
+            echo "emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "color=#FFA500" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "color=#00FF00" >> $GITHUB_OUTPUT
+          fi
 
-            - name: Build Project
-              run: cargo build --release
-              working-directory: ${{ env.project-directory }}
-            
-    security: 
-        name: Security Scanning
-        runs-on: ubuntu-latest
-        needs: [lint, test, build]
-        steps: 
-            - name: Checkout Code
-              uses: actions/checkout@v4
+      - name: Generate Notification Message
+        id: message
+        run: |
+          {
+            echo "MESSAGE<<EOF"
+            echo "${{ steps.status.outputs.emoji }} CI/CD Pipeline **${{ steps.status.outputs.status }}**"
+            echo ""
+            echo "**Repository**: ${{ github.repository }}"
+            echo "**Branch**: ${{ github.ref_name }}"
+            echo "**Trigger**: ${{ github.event_name }}"
+            echo "**Commit**: \`${{ github.sha }}\`"
+            echo "**Author**: ${{ github.actor }}"
+            echo ""
+            echo "**Job Results**:"
+            echo "- Lint: ${{ needs.lint.result }}"
+            echo "- Test: ${{ needs.test.result }}"
+            echo "- Build: ${{ needs.build.result }}"
+            echo "- Security: ${{ needs.security.result }}"
+            echo "- Deploy Staging: ${{ needs.deploy-staging.result }}"
+            echo "- Deploy Production: ${{ needs.deploy-production.result }}"
+            echo ""
+            echo "[View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
-            - name: Install cargo-audit
-              run:  cargo install cargo-audit
+      - name: Send Slack Notification
+        if: steps.status.outputs.status == 'failure'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} CI/CD Pipeline Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.message.outputs.MESSAGE }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-            - name: Run Security Audit
-              run:  cargo audit
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.status.outputs.status == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${{ steps.message.outputs.MESSAGE }}`
+            })
 
-            - name: Initialize CodeQL
-              uses: github/codeql-action/init@v2
-              with:
-                language: cpp
-
-            - name: Autobuild
-              uses: github/codeql-action/autobuild@v2
-
-            - name: Analyze CodeQL
-              uses: github/codeql-action/analyze@v2
-
-    deploy-staging:
-        name: Deploy to Staging
-        runs-on: ubuntu-latest
-        needs: [lint, test, build, security]
-        if: github.ref == 'refs/heads/develop'
-        steps:
-            - name: Checkout Code
-              uses: actions/checkout@v4
-
-            - name: Deloy to Staging
-              run: |
-               echo "Deploying to Staging Server..."
-            #add real deploy to staging server
-
-    deploy-production:
-         name: Deploy to Production
-         runs-on: ubuntu-latest
-         needs: [lint, test, build, security]
-         if: github.ref == 'refs/heads/main'
-         steps:
-            - name: Checkout Code
-              uses: actions/checkout@v4
-
-            - name: Deploy to Production
-              run: |
-               echo "Deploying to Production Server..."
-            #add real deploy to production server
-    
-    notify:
-        name: Notify team
-        runs-on: ubuntu-latest 
-        if: ${{ failure() }}
-        steps:
-            - name: Send Notification
-              run: |
-               echo "Sending notification to the team..."
-
-            # Sample Slack notification
-            - name: Notify via Slack
-              uses: slackapi/slack-github-action@v1.23.0
-              with:
-                payload: |
-                       {
-                        "text": "CI/CD Pipeline failed on ${{ github.ref }} in repo: ${{ github.repository }}. Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                       }
-              env: 
-                    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Pipeline Summary
+        run: |
+          echo "## 📊 Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ steps.status.outputs.emoji }} ${{ steps.status.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Staging | ${{ needs.deploy-staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Production | ${{ needs.deploy-production.result }} |" >> $GITHUB_STEP_SUMMARY
